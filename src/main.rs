@@ -7,6 +7,7 @@ use pagerduty::{get_pagerduty_schedule, FinalPagerDutySchedule};
 use reqwest::{self, Client};
 use std::iter::zip;
 use std::{env, fs};
+use tabled::{Table, Tabled};
 
 mod gcal;
 mod pagerduty;
@@ -85,12 +86,9 @@ async fn main() -> Result<(), String> {
         Err(e) => return Err(e.to_string()),
         Ok(_) => token,
     };
-
     fs::write(token_file, &token).expect("Unable to write token file");
-    println!("token: {}", &token);
 
     //pagerduty
-
     let pd_schedule =
         get_pagerduty_schedule(&client, api_key, pd_schedule_id, start_time, end_time).await;
 
@@ -132,69 +130,69 @@ async fn main() -> Result<(), String> {
         .flatten()
         .collect();
 
-    let (rescheduled_shifts, swap_chain) = recursive_solution(&current_shifts, Vec::new());
-    println!("Generating swap chain......");
-    for swap in swap_chain {
-        println!("{}", swap);
-    }
-    println!("Final swaps to carry out:");
-    print_diff_of_shift(current_shifts, rescheduled_shifts);
+    println!("Total number of shifts: {}", current_shifts.len());
 
-    // // find conflicts. i.e. can't attend shifts
-    // let (mut remaining_pool, mut conflict_pool) =
-    //     available_shifts.fold((Vec::new(), Vec::new()), |acc, x| {
-    //         let current_slot = x.pd_schedule;
-    //         let available_slots = x.available_slots;
-    //         let mut pool = acc.0;
-    //         let mut conflicts = acc.1;
-    //         if has_conflicts(&current_slot, &available_slots) {
-    //             conflicts.push(FinalEntity {
-    //                 pd_schedule: current_slot,
-    //                 available_slots,
-    //             });
-    //         } else {
-    //             pool.push(FinalEntity {
-    //                 pd_schedule: current_slot,
-    //                 available_slots,
-    //             });
-    //         }
-    //         return (pool, conflicts);
-    //     });
+    let unavailable_folks: Vec<ZeroSwaps> = current_shifts
+        .clone()
+        .into_iter()
+        .filter(|shift| shift.available_slots.len() == 0)
+        .map(|x| convert_to_zero_swaps(x.pd_schedule))
+        .collect();
+    if unavailable_folks.len() > 0 {
+        println!(
+            "\n========Folks with zero swaps found. Please remove them from the pd schedule======="
+        );
+        println!("{}", Table::new(unavailable_folks).to_string());
+        return Err("Folks with zero slots available".to_string());
+    };
 
-    // // sort that list by people with the least slots
-    // conflict_pool.sort_by(|a, b| a.available_slots.len().cmp(&b.available_slots.len()));
-    // remaining_pool.sort_by(|a, b| a.available_slots.len().cmp(&b.available_slots.len()));
+    let (rescheduled_shifts, swaps) = recursive_solution(&current_shifts, Vec::new());
+    // TODO: Util function to print this properly
+    println!(
+        "\n========Simulating swaps. Note that these are sequential and stateful=============="
+    );
+    println!("{}", Table::new(swaps).to_string());
 
-    // println!("Size of conflict pool: {}", conflict_pool.len());
-    // for i in conflict_pool {
-    //     let schedule = i.pd_schedule;
-    //     let slots = i.available_slots;
-    //     // find potential swaps
-    //     println!(
-    //         "Conflicts for {:?} who can attend {:?} slots",
-    //         schedule, slots
-    //     );
-    // }
-
-    // Recursive solution
-    // Get schedule
-    // Find conflict with least potential swaps
-    // if no conflicts, return
-    // Find best possible swap
-    // Perform swap
-    // return schedule
-
-    // for i in remaining_pool {
-    //     let schedule = i.0;
-    //     let slots = i.1;
-    //     println!(
-    //         "No conflicts for {:?} who can attend {:?} slots",
-    //         schedule, slots
-    //     );
-    // }
+    // TODO: Print this as a table for readability
+    let final_overrides = print_diff_of_shift(current_shifts, rescheduled_shifts);
+    println!("\n====Generating final diff against current schedule======");
+    println!("{}", Table::new(final_overrides).to_string());
 
     return Ok(());
 }
+
+// Final displays for table
+#[derive(Tabled)]
+struct ZeroSwaps {
+    email: String,
+    start: String,
+    end: String,
+}
+
+fn convert_to_zero_swaps(input: FinalPagerDutySchedule) -> ZeroSwaps {
+    ZeroSwaps {
+        email: input.email,
+        start: input.start.format("%c").to_string(),
+        end: input.end.format("%c").to_string(),
+    }
+}
+
+#[derive(Tabled)]
+struct SimulatedSwap {
+    person_with_conflict: String,
+    original_slot: String,
+    swapped_with: String,
+    new_slot: String,
+}
+
+#[derive(Tabled)]
+struct FinalOverride {
+    original_slot: String,
+    original_assignee: String,
+    final_override: String,
+}
+
+// End
 
 #[derive(Debug, Clone)]
 struct FinalEntity {
@@ -212,14 +210,14 @@ impl PartialEq for FinalEntity {
 
 fn recursive_solution(
     schedule: &Vec<FinalEntity>,
-    mut swap_chain: Vec<String>,
-) -> (Vec<FinalEntity>, Vec<String>) {
+    mut swaps: Vec<SimulatedSwap>,
+) -> (Vec<FinalEntity>, Vec<SimulatedSwap>) {
     let (most_restrictive_option, rest) = find_conflicts(schedule);
     // println!("most restrictive conflict: {:?}", &most_restrictive_option);
 
     // if this doesn't exist, we assume it's already solved and this is the termination condition. else, proceed
     let most_restrict_conflict = match most_restrictive_option {
-        None => return (schedule.clone(), swap_chain), // termination condition
+        None => return (schedule.clone(), swaps), // termination condition
         Some(value) => {
             assert_eq!(rest.len(), schedule.len() - 1);
             value
@@ -259,17 +257,18 @@ fn recursive_solution(
     schedule_after_swapping.push(source_modified);
     schedule_after_swapping.push(destination_modified);
     assert_eq!(schedule_after_swapping.len(), schedule.len());
-    swap_chain.push(format!(
-        "Swap {} (with conflict) <-> {} ; i.e. {} <-> {}",
-        &most_restrict_conflict.pd_schedule.email,
-        &best_swap.pd_schedule.email,
-        &most_restrict_conflict
+    swaps.push(SimulatedSwap {
+        person_with_conflict: most_restrict_conflict.pd_schedule.email,
+        original_slot: most_restrict_conflict
             .pd_schedule
             .start
-            .format("%Y-%m-%d %H:%M"),
-        &best_swap.pd_schedule.start.format("%Y-%m-%d %H:%M")
-    ));
-    return recursive_solution(&schedule_after_swapping, swap_chain);
+            .format("%c")
+            .to_string(),
+        swapped_with: best_swap.pd_schedule.email,
+        new_slot: best_swap.pd_schedule.start.format("%c").to_string(),
+    });
+    // println!("{}", &swap_string);
+    return recursive_solution(&schedule_after_swapping, swaps);
 }
 
 /// find the most restrictive conflict, and return: (most_restrictive_conflict, rest_with_conflict_removed)
@@ -470,7 +469,12 @@ fn has_conflicts(current_slot: &FinalPagerDutySchedule, available_slots: &Vec<On
 
 /// Get diff a shift. A loop of a loop, pretty inefficient
 /// Can be made better by pre-sorting both and zipping?
-fn print_diff_of_shift(mut initial_shifts: Vec<FinalEntity>, mut final_shifts: Vec<FinalEntity>) {
+fn print_diff_of_shift(
+    mut initial_shifts: Vec<FinalEntity>,
+    mut final_shifts: Vec<FinalEntity>,
+) -> Vec<FinalOverride> {
+    let mut final_overrides = Vec::new();
+    // println!("\n====Generating final diff against current schedule======");
     initial_shifts.sort_by(|a, b| a.pd_schedule.start.cmp(&b.pd_schedule.start));
     final_shifts.sort_by(|a, b| a.pd_schedule.start.cmp(&b.pd_schedule.start));
     let zipped = zip(initial_shifts, final_shifts);
@@ -478,13 +482,19 @@ fn print_diff_of_shift(mut initial_shifts: Vec<FinalEntity>, mut final_shifts: V
         let (original, new) = pair;
         assert!(original.pd_schedule.start == new.pd_schedule.start);
         if original.pd_schedule.email != new.pd_schedule.email {
-            let formatted_time = original.pd_schedule.start.format("%A %-I%p (%Y-%m-%d)");
-            println!(
-                "Replace {} at slot {} with {}",
-                original.pd_schedule.email, formatted_time, new.pd_schedule.email
-            )
+            // let formatted_time = original.pd_schedule.start.format("%A %-I%p (%Y-%m-%d)");
+            // println!(
+            //     "Replace {} at slot {} with {}",
+            //     original.pd_schedule.email, formatted_time, new.pd_schedule.email
+            // );
+            final_overrides.push(FinalOverride {
+                original_assignee: original.pd_schedule.email,
+                original_slot: original.pd_schedule.start.format("%c").to_string(),
+                final_override: new.pd_schedule.email,
+            });
         }
     }
+    return final_overrides;
 }
 
 #[cfg(test)]
@@ -642,10 +652,12 @@ mod tests {
             },
         ];
 
-        let (rescheduled, swap_chain) = recursive_solution(&schedule, Vec::new());
-        for swap in swap_chain {
-            println!("{:#?}", swap)
-        }
-        print_diff_of_shift(schedule, rescheduled);
+        let (rescheduled, swaps) = recursive_solution(&schedule, Vec::new());
+        println!("\n========Simulating swaps==============");
+        println!("{}", Table::new(swaps).to_string());
+
+        let final_overrides = print_diff_of_shift(schedule, rescheduled);
+        println!("\n====Generating final diff against current schedule======");
+        println!("{}", Table::new(final_overrides).to_string());
     }
 }

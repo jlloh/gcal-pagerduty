@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2022-08-27
+### Added
+- Better formatting of output with tabled crate
+
 ## [0.1.2] - 2022-08-26
 ### Added
 - Removed oob flow and start a webserver on port 8080 for oidc authentication and token exchange
