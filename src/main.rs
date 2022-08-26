@@ -10,6 +10,7 @@ use std::{env, fs};
 
 mod gcal;
 mod pagerduty;
+mod webserver;
 
 /// Pagerduty and google calendar conflict resolver
 #[derive(Parser, Debug)]
@@ -54,6 +55,40 @@ async fn main() -> Result<(), String> {
 
     let client = reqwest::Client::new();
 
+    // Google
+    let token_file = ".google_oidc_token";
+    let retrieved_token = match fs::read_to_string(token_file) {
+        Err(_e) => {
+            println!(
+                "Local token file {} not found. Triggering oauth flow.",
+                &token_file
+            );
+            get_oauth_token(&google_client_id, &google_client_secret).await
+        }
+        Ok(value) => Ok(value),
+    };
+
+    let token = match retrieved_token {
+        Ok(inside) => inside,
+        Err(e) => return Err(e.to_string()),
+    };
+
+    // check token expiry and trigger oauth if expired
+    let token = match check_token_validity(&client, &token).await {
+        Err(e) if &e == "Unauthorised" => {
+            println!("Unauthorised. Trying to get new token.");
+            match get_oauth_token(&google_client_id, &google_client_secret).await {
+                Ok(inside) => inside,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => token,
+    };
+
+    fs::write(token_file, &token).expect("Unable to write token file");
+    println!("token: {}", &token);
+
     //pagerduty
 
     let pd_schedule =
@@ -75,30 +110,6 @@ async fn main() -> Result<(), String> {
                 && schedule.end.time() == NaiveTime::from_hms(23, 0, 0)
         })
         .collect();
-
-    let token_file = ".google_oidc_token";
-    let token = match fs::read_to_string(token_file) {
-        Err(_e) => {
-            println!(
-                "Local token file {} not found. Triggering oauth flow.",
-                &token_file
-            );
-            get_oauth_token(&google_client_id, &google_client_secret).await
-        }
-        Ok(value) => value,
-    };
-    // check token expiry and trigger oauth if expired
-    let token = match check_token_validity(&client, &token).await {
-        Err(e) if &e == "Unauthorised" => {
-            println!("Unauthorised. Trying to get new token.");
-            get_oauth_token(&google_client_id, &google_client_secret).await
-        }
-        Err(e) => return Err(e.to_string()),
-        Ok(_) => token,
-    };
-
-    fs::write(token_file, &token).expect("Unable to write token file");
-    println!("token: {}", &token);
 
     let available_shifts_futures = vec![(sg_am_shift, "AM"), (sg_pm_shift, "PM")]
         .into_iter()

@@ -2,8 +2,8 @@
 * An alternative implementation of https://github.com/corsc/pagerduty-gcal
 
 ## Instructions
-* Get client_id and client_secret from google api console for your project
-* Get the pd_api_key
+* Get client_id and client_secret from google api console (https://console.developers.google.com/projectselector/apis/credentials) for your project
+* Get the pd_api_key from pagerduty
 * Set these as environment variables
 ```
 export GOOGLE_CLIENT_ID=xxxx
