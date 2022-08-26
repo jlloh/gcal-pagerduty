@@ -1,17 +1,18 @@
 use crate::pagerduty::FinalPagerDutySchedule;
+use crate::webserver::{start_webserver, Callback};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime};
 use oauth2::basic::BasicClient;
 use oauth2::reqwest::async_http_client;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope,
-    TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
+    Scope, TokenResponse, TokenUrl,
 };
 use reqwest::Url;
 use reqwest::{self, Client};
 use serde::Deserialize;
 use serde_json;
-use std::io;
 use std::process::Command;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 #[derive(Deserialize, Debug)]
 struct CalendarEventResponse {
@@ -130,10 +131,13 @@ fn should_not_be_oncall(event: &CalendarEvent) -> bool {
     }
 }
 
-pub async fn get_oauth_token(client_id: &str, secret: &str) -> String {
+pub async fn get_oauth_token(client_id: &str, secret: &str) -> Result<String, String> {
     let auth_url = "https://accounts.google.com/o/oauth2/auth".to_string();
     let token_url = "https://oauth2.googleapis.com/token".to_string();
-    let redirect_url = "urn:ietf:wg:oauth:2.0:oob".to_string();
+    // let redirect_url = "urn:ietf:wg:oauth:2.0:oob".to_string();
+    let redirect_url = "http://localhost:8080/oauth_callback".to_string();
+
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
     let oidcclient = BasicClient::new(
         ClientId::new(client_id.to_string()),
@@ -149,8 +153,14 @@ pub async fn get_oauth_token(client_id: &str, secret: &str) -> String {
         .add_scope(Scope::new(
             "https://www.googleapis.com/auth/calendar.readonly".to_string(),
         ))
-        // .add_scope(Scope::new("write".to_string()))
+        .set_pkce_challenge(pkce_challenge)
         .url();
+
+    // Start a webserver with a channel to receive the authorisation code
+    let (sender, mut receiver): (Sender<Callback>, Receiver<Callback>) = channel(1);
+
+    let webserver_to_start = start_webserver(sender);
+    let mut handle = tokio::spawn(webserver_to_start.await);
 
     println!("Attempting to open oauth url with browser: {}", auth_url);
     let _ = Command::new("open")
@@ -158,21 +168,27 @@ pub async fn get_oauth_token(client_id: &str, secret: &str) -> String {
         .output()
         .expect("Failed to open url with browswer");
 
-    println!("Please input token you got from browser");
-    let mut exchange = String::new();
-    io::stdin().read_line(&mut exchange).unwrap();
+    tokio::select! {
+        _ = &mut handle =>  {return Err("Not ok".to_string())}
+        // x = server => {return Err(format!("Web server unexpectedly exited with reason: {:?}", x))}
 
-    let token = oidcclient
-        .exchange_code(AuthorizationCode::new(exchange))
-        // Set the PKCE code verifier.
-        .request_async(async_http_client)
-        .await
-        .unwrap()
-        .access_token()
-        .secret()
-        .clone();
-
-    return token;
+        message = receiver.recv() => {
+            let retrieved_callback = message.expect("Expected value from channel, but channel ws closed");
+            // TODO: Close server
+            handle.abort();
+            let token = oidcclient
+            .exchange_code(AuthorizationCode::new(retrieved_callback.code))
+            // Set the PKCE code verifier.
+            .set_pkce_verifier(pkce_verifier)
+            .request_async(async_http_client)
+            .await
+            .unwrap()
+            .access_token()
+            .secret()
+            .clone();
+            return Ok(token)
+        }
+    };
 }
 
 #[cfg(test)]
