@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, FixedOffset};
 use futures::future::join_all;
 use reqwest::Url;
@@ -109,20 +110,38 @@ pub async fn get_pagerduty_schedule(
         .map(|entry| get_pd_user_email(client, &api_key, entry));
 
     let results = join_all(futures).await;
-    return results;
+
+    let results_filtered = results
+        .into_iter()
+        .filter(|result| match result {
+            Ok(_) => true,
+            Err(e) => {
+                println!(
+                    "Warning. Pd lookup failed with error: {}. Skipping.",
+                    e.to_string()
+                );
+                false
+            }
+        })
+        .flatten()
+        .collect();
+
+    return results_filtered;
 }
 
 async fn get_pd_user_email(
     client: &Client,
     api_key: &str,
     entry: ScheduleEntry,
-) -> FinalPagerDutySchedule {
+) -> Result<FinalPagerDutySchedule> {
     let endpoint = match entry.user.api_url {
         Some(value) => value,
-        None => panic!(
-            "Possible invalid user in pagerduty: {:?}",
-            entry.user.summary
-        ),
+        None => {
+            return Err(anyhow!(
+                "Possible invalid user in pagerduty: {}",
+                entry.user.summary
+            ))
+        }
     };
     let request = client
         .get(endpoint)
@@ -137,9 +156,9 @@ async fn get_pd_user_email(
     let start_time = DateTime::<FixedOffset>::parse_from_rfc3339(&entry.start).unwrap();
     let end_time = DateTime::<FixedOffset>::parse_from_rfc3339(&entry.end).unwrap();
 
-    return FinalPagerDutySchedule {
+    return Ok(FinalPagerDutySchedule {
         start: start_time,
         end: end_time,
         email: user_response.user.email,
-    };
+    });
 }
