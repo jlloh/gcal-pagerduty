@@ -177,7 +177,7 @@ fn convert_to_zero_swaps(input: FinalPagerDutySchedule) -> ZeroSwaps {
     }
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Debug, Clone)]
 struct SimulatedSwap {
     person_with_conflict: String,
     original_slot: String,
@@ -225,7 +225,8 @@ fn recursive_solution(
     };
 
     // find best swap from remaining entries in schedule, and remove that from the list
-    let (best_swap_option, after_swap) = find_potential_swap(&most_restrict_conflict, &rest);
+    let (best_swap_option, after_swap) =
+        find_potential_swap(&most_restrict_conflict, &rest, swaps.clone());
     // println!("best swap: {:?}", &best_swap_option);
     let best_swap = match best_swap_option {
         None => todo!(), // should panic? no swaps
@@ -242,16 +243,20 @@ fn recursive_solution(
             end: best_swap.pd_schedule.end,
             email: most_restrict_conflict.pd_schedule.email.clone(),
         },
-        available_slots: most_restrict_conflict.available_slots,
+        available_slots: most_restrict_conflict.clone().available_slots,
     };
+    // println!("original conflicter: {:?}", most_restrict_conflict);
+    // println!("after modifed: {:?}", source_modified);
     let destination_modified = FinalEntity {
         pd_schedule: FinalPagerDutySchedule {
             start: most_restrict_conflict.pd_schedule.start,
             end: most_restrict_conflict.pd_schedule.end,
             email: best_swap.pd_schedule.email.clone(),
         },
-        available_slots: best_swap.available_slots,
+        available_slots: best_swap.clone().available_slots,
     };
+    // println!("original to swap: {:?}", best_swap);
+    // println!("swap modifed: {:?}", destination_modified);
 
     let mut schedule_after_swapping = after_swap;
     schedule_after_swapping.push(source_modified);
@@ -267,6 +272,13 @@ fn recursive_solution(
         swapped_with: best_swap.pd_schedule.email,
         new_slot: best_swap.pd_schedule.start.format("%c").to_string(),
     });
+    if swaps.len() > 100 {
+        for swap in swaps {
+            println!("{:?}", swap);
+        }
+
+        panic!("Unable to find solution")
+    }
     // println!("{}", &swap_string);
     return recursive_solution(&schedule_after_swapping, swaps);
 }
@@ -312,6 +324,7 @@ fn find_potential_swap(
     // current_slot: &FinalPagerDutySchedule,
     current_slot: &FinalEntity,
     all_slots: &Vec<FinalEntity>,
+    swaps: Vec<SimulatedSwap>,
 ) -> (Option<FinalEntity>, Vec<FinalEntity>) {
     let mut potential_swaps: Vec<FinalEntity> = current_slot
         .clone()
@@ -327,6 +340,25 @@ fn find_potential_swap(
         .cloned()
         .collect();
     potential_swaps.sort_by(|a, b| a.available_slots.len().cmp(&b.available_slots.len()));
+    let last_swap = swaps.last();
+    if last_swap.is_some() {
+        // println!("last_swap: {:?}", &last_swap);
+        // Remove the last swap from the pool to avoid a cyclic error
+        potential_swaps = potential_swaps
+            .into_iter()
+            .filter(|x| x.pd_schedule.email != last_swap.unwrap().person_with_conflict)
+            .collect();
+    };
+    if swaps.len() >= 2 {
+        let last_last_swap = swaps.get(&swaps.len() - 2);
+        // println!("last_last_swap: {:?}", &last_last_swap);
+        if last_last_swap.is_some() {
+            potential_swaps = potential_swaps
+                .into_iter()
+                .filter(|x| x.pd_schedule.email != last_last_swap.unwrap().person_with_conflict)
+                .collect();
+        }
+    }
     // brute force for now and loop through another time
     // TODO: Write the above as a fold and avoid another loop
     let mut remaining_pool: Vec<FinalEntity> = all_slots
