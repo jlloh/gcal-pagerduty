@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2022-09-02
+### Changed
+- Fixed some cyclic cases temporarily by checking last two swaps. Should find a better way around this
+
 ## [0.1.3] - 2022-08-27
 ### Added
 - Better formatting of output with tabled crate

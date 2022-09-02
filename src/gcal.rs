@@ -26,6 +26,8 @@ pub struct CalendarEvent {
     // creator: Option<EventCreator>,
     pub start: Option<TimeWrapper>,
     pub end: Option<TimeWrapper>,
+    #[serde(rename = "eventType")]
+    pub event_type: Option<String>,
     // extra metadata after joining
     pub pagerduty: Option<FinalPagerDutySchedule>,
 }
@@ -127,6 +129,11 @@ fn should_not_be_oncall(event: &CalendarEvent) -> bool {
     match &event.summary {
         Some(value) if value.to_lowercase().contains("xoncall") => true,
         Some(value) if value.to_lowercase().contains("out of") => true,
+        Some(_) if event.event_type.is_some() => match &event.event_type {
+            Some(event_type) if event_type.to_lowercase() == "outofoffice" => true,
+            _ => false,
+        },
+        // Some(value) if value.to_lowercase().contains("ooo") => true,
         _ => false,
     }
 }
@@ -203,6 +210,7 @@ mod tests {
             start: None,
             end: None,
             pagerduty: None,
+            event_type: None,
         };
         assert_eq!(should_not_be_oncall(&ooo), true);
         let xoncall = CalendarEvent {
@@ -211,6 +219,7 @@ mod tests {
             start: None,
             end: None,
             pagerduty: None,
+            event_type: None,
         };
         assert_eq!(should_not_be_oncall(&xoncall), true);
     }
