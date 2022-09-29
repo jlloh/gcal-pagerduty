@@ -319,8 +319,6 @@ fn find_conflicts(available_shifts: &[FinalEntity]) -> (Option<FinalEntity>, Vec
         }
         None => (None, remaining_pool),
     }
-
-    // return conflict_pool;
 }
 
 fn find_potential_swap(
@@ -398,11 +396,9 @@ async fn get_available_shifts_per_user(
         .collect::<AnyhowResult<Vec<(FinalPagerDutySchedule, Vec<CalendarEvent>)>>>()?;
 
     // availble oncall slots
-    // let available_oncalls: Vec<FinalEntity> = results?
 
     let available_oncall_slots: Vec<Vec<OncallSlot>> = results
         .iter()
-        // .into_iter()
         .map(|(_user, user_events)| {
             let available_slots = get_available_slots(
                 user_events,
@@ -420,16 +416,7 @@ async fn get_available_shifts_per_user(
             available_slots,
         })
         .collect();
-    // .map(|(user, user_events)| FinalEntity {
-    //     pd_schedule: user,
-    //     available_slots: get_available_slots(
-    //         user_events,
-    //         shift_type,
-    //         start_time_local.date().format("%Y-%m-%d").to_string(),
-    //         duration_days,
-    //     )?,
-    // })
-    // .collect();
+
     Ok(available_oncalls)
 }
 
@@ -543,11 +530,6 @@ fn print_diff_of_shift(
         let (original, new) = pair;
         assert!(original.pd_schedule.start == new.pd_schedule.start);
         if original.pd_schedule.email != new.pd_schedule.email {
-            // let formatted_time = original.pd_schedule.start.format("%A %-I%p (%Y-%m-%d)");
-            // println!(
-            //     "Replace {} at slot {} with {}",
-            //     original.pd_schedule.email, formatted_time, new.pd_schedule.email
-            // );
             final_overrides.push(FinalOverride {
                 original_assignee: original.pd_schedule.email,
                 original_slot: original.pd_schedule.start.format("%c").to_string(),
