@@ -1,4 +1,5 @@
 use crate::gcal::{check_token_validity, get_oauth_token, get_start_end_time};
+use anyhow::{anyhow, Context, Result as AnyhowResult};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, NaiveTime};
 use clap::Parser;
 use futures::future::join_all;
@@ -27,24 +28,24 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), String> {
+async fn main() -> AnyhowResult<()> {
     // Environment variables
     const PD_API_KEY: &str = "PD_API_KEY";
     const GOOGLE_CLIENT_ID: &str = "GOOGLE_CLIENT_ID";
     const GOOGLE_CLIENT_SECRET: &str = "GOOGLE_CLIENT_SECRET";
 
-    let api_key = env::var(PD_API_KEY).expect(&format!(
+    let api_key = env::var(PD_API_KEY).context(format!(
         "Expected environment variable {} to be set",
         PD_API_KEY
-    ));
-    let google_client_id = env::var(GOOGLE_CLIENT_ID).expect(&format!(
+    ))?;
+    let google_client_id = env::var(GOOGLE_CLIENT_ID).context(format!(
         "Expected environment variable {} to be set",
         GOOGLE_CLIENT_ID
-    ));
-    let google_client_secret = env::var(GOOGLE_CLIENT_SECRET).expect(&format!(
+    ))?;
+    let google_client_secret = env::var(GOOGLE_CLIENT_SECRET).context(format!(
         "Expected environment variable {} to be set",
         GOOGLE_CLIENT_SECRET
-    ));
+    ))?;
 
     // Command line args
     let args = Args::parse();
@@ -58,7 +59,7 @@ async fn main() -> Result<(), String> {
 
     // Google
     let token_file = ".google_oidc_token";
-    let retrieved_token = match fs::read_to_string(token_file) {
+    let token = match fs::read_to_string(token_file) {
         Err(_e) => {
             println!(
                 "Local token file {} not found. Triggering oauth flow.",
@@ -67,30 +68,27 @@ async fn main() -> Result<(), String> {
             get_oauth_token(&google_client_id, &google_client_secret).await
         }
         Ok(value) => Ok(value),
-    };
-
-    let token = match retrieved_token {
-        Ok(inside) => inside,
-        Err(e) => return Err(e.to_string()),
-    };
+    }
+    .context("Failed to get token from oauth flow")?;
 
     // check token expiry and trigger oauth if expired
     let token = match check_token_validity(&client, &token).await {
-        Err(e) if &e == "Unauthorised" => {
+        Err(e) if e.root_cause().to_string() == "Unauthorised" => {
             println!("Unauthorised. Trying to get new token.");
-            match get_oauth_token(&google_client_id, &google_client_secret).await {
-                Ok(inside) => inside,
-                Err(e) => return Err(e.to_string()),
-            }
+            get_oauth_token(&google_client_id, &google_client_secret)
+                .await
+                .context("Failed to get oauth token when trying to refresh after unauthorised")?
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(e).context("Non-unauthorised error, not refreshing token"),
         Ok(_) => token,
     };
-    fs::write(token_file, &token).expect("Unable to write token file");
+    fs::write(token_file, &token).context("Unable to write token file")?;
 
     //pagerduty
     let pd_schedule =
-        get_pagerduty_schedule(&client, api_key, pd_schedule_id, start_time, end_time).await;
+        get_pagerduty_schedule(&client, api_key, pd_schedule_id, start_time, end_time)
+            .await
+            .context("Failed to get pd schedule")?;
 
     let sg_am_shift: Vec<FinalPagerDutySchedule> = pd_schedule
         .clone()
@@ -127,6 +125,9 @@ async fn main() -> Result<(), String> {
     let current_shifts: Vec<FinalEntity> = join_all(available_shifts_futures)
         .await
         .into_iter()
+        .collect::<AnyhowResult<Vec<Vec<FinalEntity>>>>()
+        .context("Join error when getting pd shifts")?
+        .into_iter()
         .flatten()
         .collect();
 
@@ -135,30 +136,32 @@ async fn main() -> Result<(), String> {
     let unavailable_folks: Vec<ZeroSwaps> = current_shifts
         .clone()
         .into_iter()
-        .filter(|shift| shift.available_slots.len() == 0)
+        .filter(|shift| shift.available_slots.is_empty())
         .map(|x| convert_to_zero_swaps(x.pd_schedule))
         .collect();
-    if unavailable_folks.len() > 0 {
+    if !unavailable_folks.is_empty() {
         println!(
             "\n========Folks with zero swaps found. Please remove them from the pd schedule======="
         );
-        println!("{}", Table::new(unavailable_folks).to_string());
-        return Err("Folks with zero slots available".to_string());
+        println!("{}", Table::new(unavailable_folks));
+        return Err(anyhow!("Folks with zero slots available").context(
+            "Failed to generate schedule because there are folks who can't be scheduled",
+        ));
     };
 
-    let (rescheduled_shifts, swaps) = recursive_solution(&current_shifts, Vec::new());
+    let (rescheduled_shifts, swaps) = recursive_solution(&current_shifts, Vec::new())?;
     // TODO: Util function to print this properly
     println!(
         "\n========Simulating swaps. Note that these are sequential and stateful=============="
     );
-    println!("{}", Table::new(swaps).to_string());
+    println!("{}", Table::new(swaps));
 
     // TODO: Print this as a table for readability
     let final_overrides = print_diff_of_shift(current_shifts, rescheduled_shifts);
     println!("\n====Generating final diff against current schedule======");
-    println!("{}", Table::new(final_overrides).to_string());
+    println!("{}", Table::new(final_overrides));
 
-    return Ok(());
+    Ok(())
 }
 
 // Final displays for table
@@ -211,13 +214,13 @@ impl PartialEq for FinalEntity {
 fn recursive_solution(
     schedule: &Vec<FinalEntity>,
     mut swaps: Vec<SimulatedSwap>,
-) -> (Vec<FinalEntity>, Vec<SimulatedSwap>) {
+) -> AnyhowResult<(Vec<FinalEntity>, Vec<SimulatedSwap>)> {
     let (most_restrictive_option, rest) = find_conflicts(schedule);
     // println!("most restrictive conflict: {:?}", &most_restrictive_option);
 
     // if this doesn't exist, we assume it's already solved and this is the termination condition. else, proceed
     let most_restrict_conflict = match most_restrictive_option {
-        None => return (schedule.clone(), swaps), // termination condition
+        None => return Ok((schedule.clone(), swaps)), // termination condition
         Some(value) => {
             assert_eq!(rest.len(), schedule.len() - 1);
             value
@@ -277,17 +280,17 @@ fn recursive_solution(
             println!("{:?}", swap);
         }
 
-        panic!("Unable to find solution")
+        return Err(anyhow!("Unable to find solution"));
     }
     // println!("{}", &swap_string);
-    return recursive_solution(&schedule_after_swapping, swaps);
+    recursive_solution(&schedule_after_swapping, swaps)
 }
 
 /// find the most restrictive conflict, and return: (most_restrictive_conflict, rest_with_conflict_removed)
-fn find_conflicts(available_shifts: &Vec<FinalEntity>) -> (Option<FinalEntity>, Vec<FinalEntity>) {
+fn find_conflicts(available_shifts: &[FinalEntity]) -> (Option<FinalEntity>, Vec<FinalEntity>) {
     let (mut remaining_pool, mut conflict_pool) =
         available_shifts
-            .into_iter()
+            .iter()
             .fold((Vec::new(), Vec::new()), |acc, x| {
                 let current_slot = (&x.pd_schedule).clone();
                 let available_slots = (&x.available_slots).clone();
@@ -304,7 +307,7 @@ fn find_conflicts(available_shifts: &Vec<FinalEntity>) -> (Option<FinalEntity>, 
                         available_slots,
                     });
                 }
-                return (pool, conflicts);
+                (pool, conflicts)
             });
     conflict_pool.sort_by(|a, b| a.available_slots.len().cmp(&b.available_slots.len()));
     // remove first conflict and put the rest back into the pool
@@ -312,7 +315,7 @@ fn find_conflicts(available_shifts: &Vec<FinalEntity>) -> (Option<FinalEntity>, 
         Some((most_restrictive, rest)) => {
             let mut to_move = rest.to_vec();
             remaining_pool.append(&mut to_move);
-            return (Some(most_restrictive.clone()), remaining_pool);
+            (Some(most_restrictive.clone()), remaining_pool)
         }
         None => (None, remaining_pool),
     }
@@ -323,54 +326,53 @@ fn find_conflicts(available_shifts: &Vec<FinalEntity>) -> (Option<FinalEntity>, 
 fn find_potential_swap(
     // current_slot: &FinalPagerDutySchedule,
     current_slot: &FinalEntity,
-    all_slots: &Vec<FinalEntity>,
+    all_slots: &[FinalEntity],
     swaps: Vec<SimulatedSwap>,
 ) -> (Option<FinalEntity>, Vec<FinalEntity>) {
     let mut potential_swaps: Vec<FinalEntity> = current_slot
         .clone()
         .available_slots
         .into_iter()
-        .map(|available_slot| {
-            all_slots.into_iter().filter(move |slot| {
+        .flat_map(|available_slot| {
+            all_slots.iter().filter(move |slot| {
                 slot.pd_schedule.start == available_slot.start_time
                     && slot.pd_schedule.end == available_slot.end_time
             })
         })
-        .flatten()
         .cloned()
         .collect();
     potential_swaps.sort_by(|a, b| a.available_slots.len().cmp(&b.available_slots.len()));
     let last_swap = swaps.last();
-    if last_swap.is_some() {
+    if let Some(swap) = last_swap {
         // println!("last_swap: {:?}", &last_swap);
         // Remove the last swap from the pool to avoid a cyclic error
         potential_swaps = potential_swaps
             .into_iter()
-            .filter(|x| x.pd_schedule.email != last_swap.unwrap().person_with_conflict)
+            .filter(|x| x.pd_schedule.email != swap.person_with_conflict)
             .collect();
     };
     if swaps.len() >= 2 {
         let last_last_swap = swaps.get(&swaps.len() - 2);
         // println!("last_last_swap: {:?}", &last_last_swap);
-        if last_last_swap.is_some() {
+        if let Some(last_last_swap) = last_last_swap {
             potential_swaps = potential_swaps
                 .into_iter()
-                .filter(|x| x.pd_schedule.email != last_last_swap.unwrap().person_with_conflict)
+                .filter(|x| x.pd_schedule.email != last_last_swap.person_with_conflict)
                 .collect();
         }
     }
     // brute force for now and loop through another time
     // TODO: Write the above as a fold and avoid another loop
     let mut remaining_pool: Vec<FinalEntity> = all_slots
-        .into_iter()
-        .filter(|slot| !potential_swaps.contains(&slot))
+        .iter()
+        .filter(|slot| !potential_swaps.contains(slot))
         .cloned()
         .collect();
     match potential_swaps.split_first() {
         Some((best_swap, rest)) => {
             let mut to_move = rest.to_vec();
             remaining_pool.append(&mut to_move);
-            return (Some(best_swap.clone()), remaining_pool);
+            (Some(best_swap.clone()), remaining_pool)
         }
         None => (None, remaining_pool),
     }
@@ -385,28 +387,50 @@ async fn get_available_shifts_per_user(
     end_time_local: DateTime<FixedOffset>,
     duration_days: i64,
     shift_type: &str,
-) -> Vec<FinalEntity> {
-    let futures = shifts.into_iter().map(|user_pd| {
-        get_user_calender(&client, user_pd, &token, start_time_local, end_time_local)
-    });
+) -> AnyhowResult<Vec<FinalEntity>> {
+    let futures = shifts
+        .into_iter()
+        .map(|user_pd| get_user_calender(client, user_pd, token, start_time_local, end_time_local));
 
-    let results: Vec<(FinalPagerDutySchedule, Vec<CalendarEvent>)> =
-        join_all(futures).await.into_iter().collect();
+    let results: Vec<(FinalPagerDutySchedule, Vec<CalendarEvent>)> = join_all(futures)
+        .await
+        .into_iter()
+        .collect::<AnyhowResult<Vec<(FinalPagerDutySchedule, Vec<CalendarEvent>)>>>()?;
 
     // availble oncall slots
-    let available_oncalls: Vec<FinalEntity> = results
-        .into_iter()
-        .map(|(user, user_events)| FinalEntity {
-            pd_schedule: user,
-            available_slots: get_available_slots(
+    // let available_oncalls: Vec<FinalEntity> = results?
+
+    let available_oncall_slots: Vec<Vec<OncallSlot>> = results
+        .iter()
+        // .into_iter()
+        .map(|(_user, user_events)| {
+            let available_slots = get_available_slots(
                 user_events,
                 shift_type,
                 start_time_local.date().format("%Y-%m-%d").to_string(),
                 duration_days,
-            ),
+            );
+            available_slots
+        })
+        .collect::<AnyhowResult<Vec<Vec<OncallSlot>>>>()?;
+
+    let available_oncalls: Vec<FinalEntity> = zip(results, available_oncall_slots)
+        .map(|((user, _), available_slots)| FinalEntity {
+            pd_schedule: user,
+            available_slots,
         })
         .collect();
-    return available_oncalls;
+    // .map(|(user, user_events)| FinalEntity {
+    //     pd_schedule: user,
+    //     available_slots: get_available_slots(
+    //         user_events,
+    //         shift_type,
+    //         start_time_local.date().format("%Y-%m-%d").to_string(),
+    //         duration_days,
+    //     )?,
+    // })
+    // .collect();
+    Ok(available_oncalls)
 }
 
 #[derive(Debug, Clone)]
@@ -415,17 +439,21 @@ struct OncallSlot {
     end_time: DateTime<FixedOffset>,
 }
 
-fn get_oncall_slots(shift_type: &str, start_date: String, duration_days: i64) -> Vec<OncallSlot> {
+/// Get oncall slots for a given shift for a date range
+fn get_oncall_slots(
+    shift_type: &str,
+    start_date: String,
+    duration_days: i64,
+) -> AnyhowResult<Vec<OncallSlot>> {
     let start_time = match shift_type {
-        x if x == "AM".to_string() => "07:00",
-        x if x == "PM".to_string() => "15:00",
+        x if x == "AM" => "07:00",
+        x if x == "PM" => "15:00",
         _ => "error",
     };
     let sgt_timezone = FixedOffset::east(8 * 60 * 60);
     let start_datetime_string = format!("{} {}", start_date, start_time);
-    // println!("{}", &start_datetime_string);
     let start_time = NaiveDateTime::parse_from_str(&start_datetime_string, "%Y-%m-%d %H:%M")
-        .expect(&format!("Error parsing {}", &start_datetime_string));
+        .context(format!("Error parsing {}", &start_datetime_string))?;
     let start_time_local = DateTime::<FixedOffset>::from_local(start_time, sgt_timezone);
     let mut final_vec = Vec::new();
     for i in 0..duration_days {
@@ -441,22 +469,23 @@ fn get_oncall_slots(shift_type: &str, start_date: String, duration_days: i64) ->
         };
         final_vec.push(slot);
     }
-    return final_vec;
+    Ok(final_vec)
 }
 
 // For every user, generate a list of "available shifts"
 fn get_available_slots(
-    user_events: Vec<CalendarEvent>,
+    user_events: &Vec<CalendarEvent>,
     shift_type: &str,
     start_date: String,
     duration_days: i64,
-) -> Vec<OncallSlot> {
-    let slots = get_oncall_slots(shift_type, start_date, duration_days);
+) -> AnyhowResult<Vec<OncallSlot>> {
+    let slots = get_oncall_slots(shift_type, start_date, duration_days)
+        .context("Failed to get oncall slots")?;
     let available_slots: Vec<OncallSlot> = slots
         .into_iter()
-        .filter(|oncall_slot| !slot_clashes(oncall_slot, &user_events))
+        .filter(|oncall_slot| !slot_clashes(oncall_slot, user_events))
         .collect();
-    return available_slots;
+    Ok(available_slots)
 }
 
 fn slot_clashes(oncall_slot: &OncallSlot, events: &Vec<CalendarEvent>) -> bool {
@@ -534,8 +563,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_oncall_slot() {
-        let slots = get_oncall_slots("AM", "2022-08-22".to_string(), 14);
+    fn test_get_oncall_slot() -> AnyhowResult<()> {
+        let slots = get_oncall_slots("AM", "2022-08-22".to_string(), 14)?;
         assert!(slots.len() == 14);
         let first = slots.first().unwrap();
         assert_eq!(
@@ -555,6 +584,7 @@ mod tests {
             last.end_time.to_string(),
             "2022-09-04 15:00:00 +08:00".to_string()
         );
+        Ok(())
     }
 
     #[test]
@@ -618,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recursive_solution_base_case() {
+    fn test_recursive_solution_base_case() -> AnyhowResult<()> {
         let schedule = vec![
             FinalEntity {
                 pd_schedule: FinalPagerDutySchedule {
@@ -684,12 +714,13 @@ mod tests {
             },
         ];
 
-        let (rescheduled, swaps) = recursive_solution(&schedule, Vec::new());
+        let (rescheduled, swaps) = recursive_solution(&schedule, Vec::new())?;
         println!("\n========Simulating swaps==============");
         println!("{}", Table::new(swaps).to_string());
 
         let final_overrides = print_diff_of_shift(schedule, rescheduled);
         println!("\n====Generating final diff against current schedule======");
         println!("{}", Table::new(final_overrides).to_string());
+        Ok(())
     }
 }
