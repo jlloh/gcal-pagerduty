@@ -5,6 +5,7 @@ use clap::Parser;
 use futures::future::join_all;
 use gcal::{get_user_calender, CalendarEvent, TimeWrapper};
 use pagerduty::{get_pagerduty_schedule, FinalPagerDutySchedule};
+use rand::seq::SliceRandom;
 use reqwest::{self, Client};
 use std::iter::zip;
 use std::{env, fs};
@@ -232,7 +233,11 @@ fn recursive_solution(
         find_potential_swap(&most_restrict_conflict, &rest, swaps.clone());
     // println!("best swap: {:?}", &best_swap_option);
     let best_swap = match best_swap_option {
-        None => todo!(), // should panic? no swaps
+        None => {
+            let first_swap = &swaps.first().unwrap();
+            println!("No solution found. Suggestion, try removing {} with the leaast available slots and try again.", first_swap.person_with_conflict );
+            return Err(anyhow!("No solution"));
+        } // should panic? no swaps
         Some(value) => {
             assert_eq!(after_swap.len(), rest.len() - 1);
             value
@@ -339,7 +344,9 @@ fn find_potential_swap(
         })
         .cloned()
         .collect();
-    potential_swaps.sort_by(|a, b| a.available_slots.len().cmp(&b.available_slots.len()));
+    // potential_swaps.sort_by(|a, b| a.available_slots.len().cmp(&b.available_slots.len()));
+    let mut rng = rand::thread_rng();
+    potential_swaps.shuffle(&mut rng);
     let last_swap = swaps.last();
     if let Some(swap) = last_swap {
         // println!("last_swap: {:?}", &last_swap);
@@ -486,7 +493,7 @@ fn slot_clashes(oncall_slot: &OncallSlot, events: &Vec<CalendarEvent>) -> bool {
             return true;
         }
     }
-    return false;
+    false
 }
 
 fn convert_time_wrapper(input: &TimeWrapper) -> DateTime<FixedOffset> {
@@ -503,16 +510,16 @@ fn convert_time_wrapper(input: &TimeWrapper) -> DateTime<FixedOffset> {
             DateTime::<FixedOffset>::parse_from_rfc3339(&x).unwrap()
         }
     };
-    return final_time;
+    final_time
 }
 
 /// find conflicts. I.e. his initial scheduled slot is not in the vector of available slots a person has
-fn has_conflicts(current_slot: &FinalPagerDutySchedule, available_slots: &Vec<OncallSlot>) -> bool {
-    return available_slots
-        .into_iter()
+fn has_conflicts(current_slot: &FinalPagerDutySchedule, available_slots: &[OncallSlot]) -> bool {
+    available_slots
+        .iter()
         .filter(|slot| slot.start_time == current_slot.start && slot.end_time == current_slot.end)
         .count()
-        == 0;
+        == 0
 }
 
 /// Get diff a shift. A loop of a loop, pretty inefficient
@@ -537,7 +544,7 @@ fn print_diff_of_shift(
             });
         }
     }
-    return final_overrides;
+    final_overrides
 }
 
 #[cfg(test)]
@@ -596,7 +603,7 @@ mod tests {
             },
         ];
         let result = has_conflicts(&current_pd_shift, &oncall_slots);
-        assert_eq!(result, false);
+        assert!(!result);
     }
 
     #[test]
@@ -626,7 +633,7 @@ mod tests {
             },
         ];
         let result = has_conflicts(&current_pd_shift, &oncall_slots);
-        assert_eq!(result, true);
+        assert!(result);
     }
 
     #[test]
@@ -698,11 +705,11 @@ mod tests {
 
         let (rescheduled, swaps) = recursive_solution(&schedule, Vec::new())?;
         println!("\n========Simulating swaps==============");
-        println!("{}", Table::new(swaps).to_string());
+        println!("{}", Table::new(swaps));
 
         let final_overrides = print_diff_of_shift(schedule, rescheduled);
         println!("\n====Generating final diff against current schedule======");
-        println!("{}", Table::new(final_overrides).to_string());
+        println!("{}", Table::new(final_overrides));
         Ok(())
     }
 }
