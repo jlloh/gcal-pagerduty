@@ -1,10 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result as AnyhowResult};
 use chrono::{DateTime, FixedOffset};
 use futures::future::join_all;
 use reqwest::Url;
 use reqwest::{self, Client};
 use serde::Deserialize;
-use serde_json;
 
 #[derive(Deserialize, Debug)]
 struct ScheduleResponse {
@@ -58,7 +57,7 @@ pub async fn get_pagerduty_schedule(
     schedule_id: String,
     start_time_local: DateTime<FixedOffset>,
     end_time_local: DateTime<FixedOffset>,
-) -> Vec<FinalPagerDutySchedule> {
+) -> AnyhowResult<Vec<FinalPagerDutySchedule>> {
     let url_base = format!("https://api.pagerduty.com/schedules/{}", schedule_id);
     println!(
         "Retrieving pd schedule from {} to {}",
@@ -69,39 +68,23 @@ pub async fn get_pagerduty_schedule(
         ("until", end_time_local.to_rfc3339()),
         ("time_zone", "Asia/Singapore".to_string()),
     ];
-    let url = Url::parse_with_params(&url_base, params).unwrap();
+    let url = Url::parse_with_params(&url_base, params).context("Failed to parse url")?;
 
     let request = client
         .get(url)
         .header("Authorization", format!("Token token={}", api_key));
-    // println!("{:?}", &request);
 
-    let response = request.send().await;
+    let response_text = request
+        .send()
+        .await
+        .context("Failed to call pd api")?
+        .text()
+        .await;
 
-    let response_text = match response {
-        Ok(inside) if inside.status() != 200 => {
-            panic!(
-                "Non 200 response for pd_api. Panicking {}",
-                &inside.status()
-            )
-        }
-        Ok(inside) => inside.text().await,
-        Err(e) => panic!("Panicking for pd_api because of error {}", e.to_string()),
-    };
-
-    let schedule: ScheduleResponse = match response_text {
-        Ok(inside) => match serde_json::from_str(&inside) {
-            Ok(parsed) => parsed,
-            Err(e) => panic!(
-                "Failed to parse  from json with error: {}",
-                // inside,
-                e.to_string()
-            ),
-        },
-        Err(e) => panic!("Panicking for pd_api because of error {}", e.to_string()),
-    };
-    //: ScheduleResponse
-    // &response.unwrap().text().await.unwrap()).unwrap();
+    let schedule: ScheduleResponse = serde_json::from_str(
+        &response_text.context("Failed to get text response from pd api call")?,
+    )
+    .context("Failed to parse json from pd api response")?;
 
     // retrieve emails of usrs
     let scheduled_entries = schedule.schedule.final_schedule.rendered_schedule_entries;
@@ -116,24 +99,21 @@ pub async fn get_pagerduty_schedule(
         .filter(|result| match result {
             Ok(_) => true,
             Err(e) => {
-                println!(
-                    "Warning. Pd lookup failed with error: {}. Skipping.",
-                    e.to_string()
-                );
+                println!("Warning. Pd lookup failed with error: {}. Skipping.", e);
                 false
             }
         })
         .flatten()
         .collect();
 
-    return results_filtered;
+    Ok(results_filtered)
 }
 
 async fn get_pd_user_email(
     client: &Client,
     api_key: &str,
     entry: ScheduleEntry,
-) -> Result<FinalPagerDutySchedule> {
+) -> AnyhowResult<FinalPagerDutySchedule> {
     let endpoint = match entry.user.api_url {
         Some(value) => value,
         None => {
@@ -146,19 +126,26 @@ async fn get_pd_user_email(
     let request = client
         .get(endpoint)
         .header("Authorization", format!("Token token={}", api_key));
-    // println!("{:?}", &request);
 
-    let response_text = request.send().await.unwrap().text().await.unwrap();
-    // println!("{}", response_text);
+    let response_text = request
+        .send()
+        .await
+        .context("Failed to call pd api to get user email")?
+        .text()
+        .await
+        .context("Failed to convert pd api response to text")?;
 
-    let user_response: PagerDutyUserResponse = serde_json::from_str(&response_text).unwrap();
+    let user_response: PagerDutyUserResponse = serde_json::from_str(&response_text)
+        .context("Failed to parse pagerdutyuserresponse as json")?;
 
-    let start_time = DateTime::<FixedOffset>::parse_from_rfc3339(&entry.start).unwrap();
-    let end_time = DateTime::<FixedOffset>::parse_from_rfc3339(&entry.end).unwrap();
+    let start_time = DateTime::<FixedOffset>::parse_from_rfc3339(&entry.start)
+        .context("Failed to parse start_time as rfc3339")?;
+    let end_time = DateTime::<FixedOffset>::parse_from_rfc3339(&entry.end)
+        .context("Failed to parse end_time as rfc3339")?;
 
-    return Ok(FinalPagerDutySchedule {
+    Ok(FinalPagerDutySchedule {
         start: start_time,
         end: end_time,
         email: user_response.user.email,
-    });
+    })
 }

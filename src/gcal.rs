@@ -1,5 +1,6 @@
 use crate::pagerduty::FinalPagerDutySchedule;
 use crate::webserver::{start_webserver, Callback};
+use anyhow::{anyhow, Context, Result as AnyhowResult};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime};
 use oauth2::basic::BasicClient;
 use oauth2::reqwest::async_http_client;
@@ -10,7 +11,6 @@ use oauth2::{
 use reqwest::Url;
 use reqwest::{self, Client};
 use serde::Deserialize;
-use serde_json;
 use std::process::Command;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -58,7 +58,7 @@ pub fn get_start_end_time(
     return (start_time_local, end_time_local);
 }
 
-pub async fn check_token_validity(client: &Client, token: &str) -> Result<(), String> {
+pub async fn check_token_validity(client: &Client, token: &str) -> AnyhowResult<()> {
     let url = "https://www.googleapis.com/calendar/v3/users/me/calendarList";
     let request = client
         .get(url)
@@ -67,9 +67,9 @@ pub async fn check_token_validity(client: &Client, token: &str) -> Result<(), St
     let response = request.send().await;
 
     match response {
-        Ok(inside) if inside.status() == 401 => Err("Unauthorised".to_string()),
+        Ok(inside) if inside.status() == 401 => Err(anyhow!("Unauthorised")),
         Ok(_) => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(anyhow!(e).context("Error when making request to google apis")),
     }
 }
 
@@ -79,7 +79,7 @@ pub async fn get_user_calender(
     token: &str,
     start_time_local: DateTime<FixedOffset>,
     end_time_local: DateTime<FixedOffset>,
-) -> (FinalPagerDutySchedule, Vec<CalendarEvent>) {
+) -> AnyhowResult<(FinalPagerDutySchedule, Vec<CalendarEvent>)> {
     let event_url = format!(
         "https://www.googleapis.com/calendar/v3/calendars/{}/events",
         pd_user.email
@@ -96,20 +96,16 @@ pub async fn get_user_calender(
         .get(url)
         .header("Authorization", format!("Bearer {}", token));
 
-    let response = request.send().await;
+    let result = request
+        .send()
+        .await
+        .context("Request to gcal api failed")?
+        .text()
+        .await
+        .context("Failed to convert gcal api request to text")?;
 
-    let response_parsed = match response {
-        Ok(inside) if inside.status() != 200 => {
-            panic!("Non 200 response. Panicking {}", &inside.status())
-        }
-        Ok(inside) => inside.text().await,
-        Err(e) => panic!("Panicking because of error {}", e.to_string()),
-    };
-
-    let result = response_parsed.expect("Expected valid text");
-    // println!("{}", &result);
-
-    let parsed: CalendarEventResponse = serde_json::from_str(&result).unwrap();
+    let parsed: CalendarEventResponse =
+        serde_json::from_str(&result).context("Failed to parse gcal api response as json")?;
     let public_events = parsed.items.into_iter().filter(|x| match &x.visibility {
         Some(v) if v != "private" => true,
         _ => false,
@@ -122,7 +118,7 @@ pub async fn get_user_calender(
             x
         })
         .collect();
-    return (pd_user, xoncall_calendar_events);
+    return Ok((pd_user, xoncall_calendar_events));
 }
 
 fn should_not_be_oncall(event: &CalendarEvent) -> bool {
@@ -138,7 +134,7 @@ fn should_not_be_oncall(event: &CalendarEvent) -> bool {
     }
 }
 
-pub async fn get_oauth_token(client_id: &str, secret: &str) -> Result<String, String> {
+pub async fn get_oauth_token(client_id: &str, secret: &str) -> AnyhowResult<String> {
     let auth_url = "https://accounts.google.com/o/oauth2/auth".to_string();
     let token_url = "https://oauth2.googleapis.com/token".to_string();
     // let redirect_url = "urn:ietf:wg:oauth:2.0:oob".to_string();
@@ -176,7 +172,7 @@ pub async fn get_oauth_token(client_id: &str, secret: &str) -> Result<String, St
         .expect("Failed to open url with browswer");
 
     tokio::select! {
-        _ = &mut handle =>  {return Err("Not ok".to_string())}
+        _ = &mut handle =>  {return Err(anyhow!("Not ok").context("Failed to complete auth flow"))}
         // x = server => {return Err(format!("Web server unexpectedly exited with reason: {:?}", x))}
 
         message = receiver.recv() => {
