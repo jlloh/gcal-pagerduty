@@ -97,18 +97,31 @@ async fn main() -> AnyhowResult<()> {
         .clone()
         .into_iter()
         .filter(|schedule| {
-            schedule.start.time() == NaiveTime::from_hms(7, 0, 0)
-                && schedule.end.time() == NaiveTime::from_hms(15, 0, 0)
+            schedule.start.time() == NaiveTime::from_hms(3, 0, 0)
+            // && schedule.end.time() == NaiveTime::from_hms(15, 0, 0)
         })
         .collect();
+    // assert!(sg_am_shift.len() == 14, "AM shift not full");
+    println!(
+        "AM shift size is: {}. First shift is {:?}, last shift is {:?}",
+        sg_am_shift.len(),
+        sg_am_shift.first().unwrap().email,
+        sg_am_shift.last().unwrap().email
+    );
 
     let sg_pm_shift: Vec<FinalPagerDutySchedule> = pd_schedule
         .into_iter()
         .filter(|schedule| {
             schedule.start.time() == NaiveTime::from_hms(15, 0, 0)
-                && schedule.end.time() == NaiveTime::from_hms(23, 0, 0)
+            // && schedule.end.time() == NaiveTime::from_hms(3, 0, 0)
         })
         .collect();
+    println!(
+        "PM shift size is: {}. First shift is {:?}, last shift is {:?}",
+        sg_pm_shift.len(),
+        sg_pm_shift.first().unwrap().email,
+        sg_pm_shift.last().unwrap().email
+    );
 
     let available_shifts_futures = vec![(sg_am_shift, "AM"), (sg_pm_shift, "PM")]
         .into_iter()
@@ -133,6 +146,7 @@ async fn main() -> AnyhowResult<()> {
         .into_iter()
         .flatten()
         .collect();
+    println!("{:#?}", current_shifts.first().unwrap());
 
     println!("Total number of shifts: {}", current_shifts.len());
 
@@ -254,6 +268,18 @@ fn recursive_solution(
     mut swaps: Vec<SimulatedSwap>,
 ) -> AnyhowResult<(Vec<FinalEntity>, Vec<SimulatedSwap>)> {
     let (most_restrictive_option, rest) = find_conflicts(schedule);
+    if swaps.is_empty() {
+        let mut conflicts = rest
+            .clone()
+            .into_iter()
+            .map(|x| x.pd_schedule)
+            .collect::<Vec<_>>();
+        let restrictive_formatted = most_restrictive_option.clone().unwrap().pd_schedule;
+        conflicts.push(restrictive_formatted);
+        for conflict in conflicts {
+            println!("Found conflict: {:?}", conflict)
+        }
+    }
     // println!("most restrictive conflict: {:?}", &most_restrictive_option);
 
     // if this doesn't exist, we assume it's already solved and this is the termination condition. else, proceed
@@ -319,12 +345,13 @@ fn recursive_solution(
         swapped_with: best_swap.pd_schedule.email,
         new_slot: best_swap.pd_schedule.start.format("%c").to_string(),
     });
-    if swaps.len() > 100 {
-        for swap in swaps {
+    if swaps.len() > 200 {
+        for swap in swaps.clone() {
             println!("{:?}", swap);
         }
+        // println!("No solution found. Suggestion, try removing {} with the leaast available slots and try again.", swaps.first().unwrap.person_with_conflict );
 
-        return Err(anyhow!("Unable to find solution"));
+        return Err(anyhow!("No solution found. Suggestion, try removing {} with the least available slots and try again.", swaps.first().unwrap().person_with_conflict ));
     }
     // println!("{}", &swap_string);
     recursive_solution(&schedule_after_swapping, swaps)
@@ -378,7 +405,7 @@ fn find_potential_swap(
         .flat_map(|available_slot| {
             all_slots.iter().filter(move |slot| {
                 slot.pd_schedule.start == available_slot.start_time
-                    && slot.pd_schedule.end == available_slot.end_time
+                // && slot.pd_schedule.end == available_slot.end_time
             })
         })
         .cloned()
@@ -479,7 +506,7 @@ fn get_oncall_slots(
     duration_days: i64,
 ) -> AnyhowResult<Vec<OncallSlot>> {
     let start_time = match shift_type {
-        x if x == "AM" => "07:00",
+        x if x == "AM" => "03:00",
         x if x == "PM" => "15:00",
         _ => "error",
     };
@@ -494,7 +521,7 @@ fn get_oncall_slots(
             .checked_add_signed(Duration::days(i))
             .unwrap();
         let shift_end_time = shift_start_time
-            .checked_add_signed(Duration::hours(8))
+            .checked_add_signed(Duration::hours(12))
             .unwrap();
         let slot = OncallSlot {
             start_time: shift_start_time,
@@ -556,7 +583,7 @@ fn convert_time_wrapper(input: &TimeWrapper) -> DateTime<FixedOffset> {
 fn has_conflicts(current_slot: &FinalPagerDutySchedule, available_slots: &[OncallSlot]) -> bool {
     available_slots
         .iter()
-        .filter(|slot| slot.start_time == current_slot.start && slot.end_time == current_slot.end)
+        .filter(|slot| slot.start_time == current_slot.start)
         .count()
         == 0
 }
