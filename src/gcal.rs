@@ -106,10 +106,16 @@ pub async fn get_user_calender(
 
     let parsed: CalendarEventResponse =
         serde_json::from_str(&result).context("Failed to parse gcal api response as json")?;
+
     let public_events = parsed.items.into_iter().filter(|x| match &x.visibility {
         Some(v) if v != "private" => true,
         _ => false,
     });
+
+    // let x = pd_user.clone();
+    // if x.email == "jialong.loh@grabtaxi.com" {
+    //     print!("jl: {:?}", &public_events);
+    // }
 
     let xoncall_calendar_events: Vec<CalendarEvent> = public_events
         .filter(should_not_be_oncall)

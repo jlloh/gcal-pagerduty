@@ -1,4 +1,5 @@
 use crate::gcal::{check_token_validity, get_oauth_token, get_start_end_time};
+use crate::pagerduty::{schedule_overrides, OverrideEntry, OverrideUser};
 use anyhow::{anyhow, Context, Result as AnyhowResult};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, NaiveTime};
 use clap::Parser;
@@ -7,6 +8,7 @@ use gcal::{get_user_calender, CalendarEvent, TimeWrapper};
 use pagerduty::{get_pagerduty_schedule, FinalPagerDutySchedule};
 use rand::seq::SliceRandom;
 use reqwest::{self, Client};
+use std::io;
 use std::iter::zip;
 use std::{env, fs};
 use tabled::{Table, Tabled};
@@ -87,7 +89,7 @@ async fn main() -> AnyhowResult<()> {
 
     //pagerduty
     let pd_schedule =
-        get_pagerduty_schedule(&client, api_key, pd_schedule_id, start_time, end_time)
+        get_pagerduty_schedule(&client, &api_key, &pd_schedule_id, start_time, end_time)
             .await
             .context("Failed to get pd schedule")?;
 
@@ -95,18 +97,31 @@ async fn main() -> AnyhowResult<()> {
         .clone()
         .into_iter()
         .filter(|schedule| {
-            schedule.start.time() == NaiveTime::from_hms(7, 0, 0)
-                && schedule.end.time() == NaiveTime::from_hms(15, 0, 0)
+            schedule.start.time() == NaiveTime::from_hms(3, 0, 0)
+            // && schedule.end.time() == NaiveTime::from_hms(15, 0, 0)
         })
         .collect();
+    // assert!(sg_am_shift.len() == 14, "AM shift not full");
+    println!(
+        "AM shift size is: {}. First shift is {:?}, last shift is {:?}",
+        sg_am_shift.len(),
+        sg_am_shift.first().unwrap().email,
+        sg_am_shift.last().unwrap().email
+    );
 
     let sg_pm_shift: Vec<FinalPagerDutySchedule> = pd_schedule
         .into_iter()
         .filter(|schedule| {
             schedule.start.time() == NaiveTime::from_hms(15, 0, 0)
-                && schedule.end.time() == NaiveTime::from_hms(23, 0, 0)
+            // && schedule.end.time() == NaiveTime::from_hms(3, 0, 0)
         })
         .collect();
+    println!(
+        "PM shift size is: {}. First shift is {:?}, last shift is {:?}",
+        sg_pm_shift.len(),
+        sg_pm_shift.first().unwrap().email,
+        sg_pm_shift.last().unwrap().email
+    );
 
     let available_shifts_futures = vec![(sg_am_shift, "AM"), (sg_pm_shift, "PM")]
         .into_iter()
@@ -131,6 +146,7 @@ async fn main() -> AnyhowResult<()> {
         .into_iter()
         .flatten()
         .collect();
+    println!("{:#?}", current_shifts.first().unwrap());
 
     println!("Total number of shifts: {}", current_shifts.len());
 
@@ -158,11 +174,43 @@ async fn main() -> AnyhowResult<()> {
     println!("{}", Table::new(swaps));
 
     // TODO: Print this as a table for readability
-    let final_overrides = print_diff_of_shift(current_shifts, rescheduled_shifts);
+    let final_overrides = generate_diff_of_shift(current_shifts, rescheduled_shifts);
     println!("\n====Generating final diff against current schedule======");
-    println!("{}", Table::new(final_overrides));
+    println!("{}", Table::new(&final_overrides));
 
-    Ok(())
+    // TODO: Prompt user whether they want the program to do the overrides
+    let mut user_override_prompt = "".to_string();
+    println!("Do you want to automatically schedule the overrides? (y/n)");
+    match io::stdin().read_line(&mut user_override_prompt) {
+        Ok(_) => match user_override_prompt.as_str().trim() {
+            "y" => {
+                println!("Scheduling overrides...");
+                let formatted_override: Vec<OverrideEntry> = final_overrides
+                    .into_iter()
+                    .map(|x| OverrideEntry {
+                        start: x.start_time_iso,
+                        end: x.end_time_iso,
+                        user: OverrideUser {
+                            id: x.pd_user_id,
+                            r#type: "user_reference".to_string(),
+                        },
+                    })
+                    .collect();
+                schedule_overrides(&client, &api_key, &pd_schedule_id, formatted_override)
+                    .await
+                    .context("Failed to schedule overrides")?;
+
+                Ok(())
+            }
+            "n" => {
+                println!("Skipping scheduling of overrides");
+                Ok(())
+            }
+            _ => Err(anyhow!("Unrecognised input {}", user_override_prompt)),
+        },
+        Err(e) => Err(e).context("Failed to accept user input"),
+    }
+    // Ok(())
 }
 
 // Final displays for table
@@ -194,6 +242,9 @@ struct FinalOverride {
     original_slot: String,
     original_assignee: String,
     final_override: String,
+    start_time_iso: String,
+    end_time_iso: String,
+    pd_user_id: String,
 }
 
 // End
@@ -217,6 +268,18 @@ fn recursive_solution(
     mut swaps: Vec<SimulatedSwap>,
 ) -> AnyhowResult<(Vec<FinalEntity>, Vec<SimulatedSwap>)> {
     let (most_restrictive_option, rest) = find_conflicts(schedule);
+    if swaps.is_empty() {
+        let mut conflicts = rest
+            .clone()
+            .into_iter()
+            .map(|x| x.pd_schedule)
+            .collect::<Vec<_>>();
+        let restrictive_formatted = most_restrictive_option.clone().unwrap().pd_schedule;
+        conflicts.push(restrictive_formatted);
+        for conflict in conflicts {
+            println!("Found conflict: {:?}", conflict)
+        }
+    }
     // println!("most restrictive conflict: {:?}", &most_restrictive_option);
 
     // if this doesn't exist, we assume it's already solved and this is the termination condition. else, proceed
@@ -247,6 +310,7 @@ fn recursive_solution(
     // apply swap
     let source_modified = FinalEntity {
         pd_schedule: FinalPagerDutySchedule {
+            pd_user_id: most_restrict_conflict.pd_schedule.pd_user_id.clone(),
             start: best_swap.pd_schedule.start,
             end: best_swap.pd_schedule.end,
             email: most_restrict_conflict.pd_schedule.email.clone(),
@@ -257,6 +321,7 @@ fn recursive_solution(
     // println!("after modifed: {:?}", source_modified);
     let destination_modified = FinalEntity {
         pd_schedule: FinalPagerDutySchedule {
+            pd_user_id: best_swap.pd_schedule.pd_user_id.clone(),
             start: most_restrict_conflict.pd_schedule.start,
             end: most_restrict_conflict.pd_schedule.end,
             email: best_swap.pd_schedule.email.clone(),
@@ -280,12 +345,13 @@ fn recursive_solution(
         swapped_with: best_swap.pd_schedule.email,
         new_slot: best_swap.pd_schedule.start.format("%c").to_string(),
     });
-    if swaps.len() > 100 {
-        for swap in swaps {
+    if swaps.len() > 200 {
+        for swap in swaps.clone() {
             println!("{:?}", swap);
         }
+        // println!("No solution found. Suggestion, try removing {} with the leaast available slots and try again.", swaps.first().unwrap.person_with_conflict );
 
-        return Err(anyhow!("Unable to find solution"));
+        return Err(anyhow!("No solution found. Suggestion, try removing {} with the least available slots and try again.", swaps.first().unwrap().person_with_conflict ));
     }
     // println!("{}", &swap_string);
     recursive_solution(&schedule_after_swapping, swaps)
@@ -339,7 +405,7 @@ fn find_potential_swap(
         .flat_map(|available_slot| {
             all_slots.iter().filter(move |slot| {
                 slot.pd_schedule.start == available_slot.start_time
-                    && slot.pd_schedule.end == available_slot.end_time
+                // && slot.pd_schedule.end == available_slot.end_time
             })
         })
         .cloned()
@@ -440,7 +506,7 @@ fn get_oncall_slots(
     duration_days: i64,
 ) -> AnyhowResult<Vec<OncallSlot>> {
     let start_time = match shift_type {
-        x if x == "AM" => "07:00",
+        x if x == "AM" => "03:00",
         x if x == "PM" => "15:00",
         _ => "error",
     };
@@ -455,7 +521,7 @@ fn get_oncall_slots(
             .checked_add_signed(Duration::days(i))
             .unwrap();
         let shift_end_time = shift_start_time
-            .checked_add_signed(Duration::hours(8))
+            .checked_add_signed(Duration::hours(12))
             .unwrap();
         let slot = OncallSlot {
             start_time: shift_start_time,
@@ -517,14 +583,14 @@ fn convert_time_wrapper(input: &TimeWrapper) -> DateTime<FixedOffset> {
 fn has_conflicts(current_slot: &FinalPagerDutySchedule, available_slots: &[OncallSlot]) -> bool {
     available_slots
         .iter()
-        .filter(|slot| slot.start_time == current_slot.start && slot.end_time == current_slot.end)
+        .filter(|slot| slot.start_time == current_slot.start)
         .count()
         == 0
 }
 
 /// Get diff a shift. A loop of a loop, pretty inefficient
 /// Can be made better by pre-sorting both and zipping?
-fn print_diff_of_shift(
+fn generate_diff_of_shift(
     mut initial_shifts: Vec<FinalEntity>,
     mut final_shifts: Vec<FinalEntity>,
 ) -> Vec<FinalOverride> {
@@ -541,6 +607,9 @@ fn print_diff_of_shift(
                 original_assignee: original.pd_schedule.email,
                 original_slot: original.pd_schedule.start.format("%c").to_string(),
                 final_override: new.pd_schedule.email,
+                start_time_iso: original.pd_schedule.start.format("%+").to_string(),
+                end_time_iso: original.pd_schedule.end.format("%+").to_string(),
+                pd_user_id: new.pd_schedule.pd_user_id,
             });
         }
     }
@@ -579,6 +648,7 @@ mod tests {
     #[test]
     fn test_find_conflicts_false() {
         let current_pd_shift = FinalPagerDutySchedule {
+            pd_user_id: "someid".to_string(),
             start: DateTime::<FixedOffset>::parse_from_rfc3339("2022-08-30T07:00:00+08:00")
                 .unwrap(),
             end: DateTime::<FixedOffset>::parse_from_rfc3339("2022-08-30T15:00:00+08:00").unwrap(),
@@ -609,6 +679,7 @@ mod tests {
     #[test]
     fn test_find_conflicts() {
         let current_pd_shift = FinalPagerDutySchedule {
+            pd_user_id: "someid".to_string(),
             start: DateTime::<FixedOffset>::parse_from_rfc3339("2022-08-30T07:00:00+08:00")
                 .unwrap(),
             end: DateTime::<FixedOffset>::parse_from_rfc3339("2022-08-30T15:00:00+08:00").unwrap(),
@@ -641,6 +712,7 @@ mod tests {
         let schedule = vec![
             FinalEntity {
                 pd_schedule: FinalPagerDutySchedule {
+                    pd_user_id: "someid".to_string(),
                     start: DateTime::<FixedOffset>::parse_from_rfc3339("2022-08-30T07:00:00+08:00")
                         .unwrap(),
                     end: DateTime::<FixedOffset>::parse_from_rfc3339("2022-08-30T15:00:00+08:00")
@@ -672,6 +744,7 @@ mod tests {
             },
             FinalEntity {
                 pd_schedule: FinalPagerDutySchedule {
+                    pd_user_id: "someid".to_string(),
                     start: DateTime::<FixedOffset>::parse_from_rfc3339("2022-08-31T07:00:00+08:00")
                         .unwrap(),
                     end: DateTime::<FixedOffset>::parse_from_rfc3339("2022-08-31T15:00:00+08:00")
@@ -707,7 +780,7 @@ mod tests {
         println!("\n========Simulating swaps==============");
         println!("{}", Table::new(swaps));
 
-        let final_overrides = print_diff_of_shift(schedule, rescheduled);
+        let final_overrides = generate_diff_of_shift(schedule, rescheduled);
         println!("\n====Generating final diff against current schedule======");
         println!("{}", Table::new(final_overrides));
         Ok(())

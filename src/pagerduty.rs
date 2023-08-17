@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result as AnyhowResult};
 use chrono::{DateTime, FixedOffset};
 use futures::future::join_all;
 use reqwest::Url;
 use reqwest::{self, Client};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Debug)]
 struct ScheduleResponse {
@@ -17,6 +19,7 @@ struct Schedule {
 
 #[derive(Deserialize, Debug)]
 struct PagerDutyUser {
+    id: String,
     summary: String,
     #[serde(rename = "self")]
     api_url: Option<String>,
@@ -46,15 +49,55 @@ struct ScheduleEntry {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct FinalPagerDutySchedule {
+    pub pd_user_id: String,
     pub start: DateTime<FixedOffset>,
     pub end: DateTime<FixedOffset>,
     pub email: String,
 }
 
+#[derive(Serialize, Debug)]
+pub struct OverrideEntry {
+    pub start: String,
+    pub end: String,
+    pub user: OverrideUser,
+}
+
+#[derive(Serialize, Debug)]
+pub struct OverrideUser {
+    pub id: String,
+    pub r#type: String,
+}
+
+pub async fn schedule_overrides(
+    client: &Client,
+    api_key: &str,
+    schedule_id: &str,
+    overrides: Vec<OverrideEntry>,
+) -> AnyhowResult<()> {
+    let url_base = format!(
+        "https://api.pagerduty.com/schedules/{}/overrides",
+        schedule_id
+    );
+    let body = HashMap::from([("overrides".to_string(), overrides)]);
+    let response = client
+        .post(url_base)
+        .header("Authorization", format!("Token token={}", api_key))
+        .json(&body)
+        .send()
+        .await?;
+    if response.status() != 200 {
+        return Err(anyhow!(
+            "Non 200 status while trying to override pd schedule"
+        ));
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn get_pagerduty_schedule(
     client: &Client,
-    api_key: String,
-    schedule_id: String,
+    api_key: &str,
+    schedule_id: &str,
     start_time_local: DateTime<FixedOffset>,
     end_time_local: DateTime<FixedOffset>,
 ) -> AnyhowResult<Vec<FinalPagerDutySchedule>> {
@@ -123,6 +166,7 @@ async fn get_pd_user_email(
             ))
         }
     };
+    let id = entry.user.id;
     let request = client
         .get(endpoint)
         .header("Authorization", format!("Token token={}", api_key));
@@ -144,6 +188,7 @@ async fn get_pd_user_email(
         .context("Failed to parse end_time as rfc3339")?;
 
     Ok(FinalPagerDutySchedule {
+        pd_user_id: id,
         start: start_time,
         end: end_time,
         email: user_response.user.email,

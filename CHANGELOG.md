@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2023-01-06
+- Allow automatic override of schedules from script, with a user prompt
+
+### Changed
+- Fixed some cyclic cases temporarily by checking last two swaps. Should find a better way around this
+
 ## [0.1.4] - 2022-09-02
 ### Changed
 - Fixed some cyclic cases temporarily by checking last two swaps. Should find a better way around this
